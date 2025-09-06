@@ -14,8 +14,8 @@
 
 // 保存 CPU 内存的 RGBA 图像为 BMP
 bool SaveBitmapToFile(int width, int height, const std::wstring& filename, const std::vector<BYTE>& pixels) {
-    BITMAPFILEHEADER bmfHeader = { 0 };
-    BITMAPINFOHEADER bi = { 0 };
+    BITMAPFILEHEADER bmfHeader = {0};
+    BITMAPINFOHEADER bi = {0};
 
     bi.biSize = sizeof(BITMAPINFOHEADER);
     bi.biWidth = width;
@@ -30,27 +30,78 @@ bool SaveBitmapToFile(int width, int height, const std::wstring& filename, const
     bmfHeader.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
     bmfHeader.bfSize = bmfHeader.bfOffBits + dwSizeImage;
 
-    HANDLE hFile = CreateFileW(filename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = CreateFileW(filename.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
     DWORD written;
-    WriteFile(hFile, &bmfHeader, sizeof(bmfHeader), &written, NULL);
-    WriteFile(hFile, &bi, sizeof(bi), &written, NULL);
-    WriteFile(hFile, pixels.data(), dwSizeImage, &written, NULL);
+    WriteFile(hFile, &bmfHeader, sizeof(bmfHeader), &written, nullptr);
+    WriteFile(hFile, &bi, sizeof(bi), &written, nullptr);
+    WriteFile(hFile, pixels.data(), dwSizeImage, &written, nullptr);
     CloseHandle(hFile);
     return true;
 }
 
-int wmain() {
-    // 控制台支持中文输出
-    _setmode(_fileno(stdout), _O_U16TEXT);
+// 用于存储搜索结果
+struct SearchParam {
+    std::wstring keyword;
+    HWND hwnd;
+    RECT rect;
+};
 
-    // 创建 D3D11 设备
+// 查找窗口回调
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    wchar_t title[256] = {0};
+    GetWindowTextW(hwnd, title, 256);
+    std::wstring str(title);
+
+    SearchParam* p = reinterpret_cast<SearchParam*>(lParam);
+    if (str.find(p->keyword) != std::wstring::npos) {
+        p->hwnd = hwnd;
+        GetWindowRect(hwnd, &p->rect);
+        return FALSE; // 找到窗口，停止枚举
+    }
+    return TRUE;
+}
+
+int wmain() {
+    // 支持中文输入输出
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    _setmode(_fileno(stdin), _O_U16TEXT);
+
+    std::wcout << L"请输入要截取的窗口名称关键字：";
+    std::wstring keyword;
+    std::getline(std::wcin, keyword);
+
+    SearchParam param;
+    param.keyword = keyword;
+    param.hwnd = nullptr;
+    param.rect = {0};
+
+    EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&param));
+
+    if (!param.hwnd) {
+        std::wcerr << L"未找到匹配窗口！\n";
+        return -1;
+    }
+
+    int winLeft = param.rect.left;
+    int winTop = param.rect.top;
+    int winWidth = param.rect.right - param.rect.left;
+    int winHeight = param.rect.bottom - param.rect.top;
+
+    std::wcout << L"窗口 HWND: " << param.hwnd 
+               << L" 位置: (" << winLeft << L"," << winTop
+               << L") 大小: " << winWidth << L"x" << winHeight << L"\n";
+
+    // ---- D3D11 截屏 ----
     D3D_FEATURE_LEVEL featureLevel;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        nullptr, 0, D3D11_SDK_VERSION, &device, &featureLevel, &context))) {
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        &device, &featureLevel, &context))) {
         std::wcerr << L"D3D11CreateDevice 失败！\n";
         return -1;
     }
@@ -73,7 +124,6 @@ int wmain() {
         return -1;
     }
 
-    // 获取桌面帧
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
     if (FAILED(duplication->AcquireNextFrame(1000, &frameInfo, &desktopResource))) {
@@ -84,7 +134,6 @@ int wmain() {
     ID3D11Texture2D* desktopImage = nullptr;
     desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&desktopImage);
 
-    // 把 GPU 图像复制到 CPU 可访问纹理
     D3D11_TEXTURE2D_DESC desc;
     desktopImage->GetDesc(&desc);
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -96,37 +145,35 @@ int wmain() {
     device->CreateTexture2D(&desc, nullptr, &cpuTex);
     context->CopyResource(cpuTex, desktopImage);
 
-    // Map CPU 可访问纹理
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(context->Map(cpuTex, 0, D3D11_MAP_READ, 0, &mapped))) {
         std::wcerr << L"Map 失败！\n";
         return -1;
     }
 
-    // 保存整张桌面截图
-    std::vector<BYTE> fullPixels(desc.Width * desc.Height * 4);
-    BYTE* src = (BYTE*)mapped.pData;
-    for (int y = 0; y < (int)desc.Height; y++) {
+    // 裁剪窗口区域
+    std::vector<BYTE> windowPixels(winWidth * winHeight * 4);
+    for (int y = 0; y < winHeight; y++) {
         memcpy(
-            &fullPixels[y * desc.Width * 4],
-            src + y * mapped.RowPitch,
-            desc.Width * 4
+            &windowPixels[y * winWidth * 4],
+            (BYTE*)mapped.pData + (y + winTop) * mapped.RowPitch + winLeft * 4,
+            winWidth * 4
         );
     }
+
     context->Unmap(cpuTex, 0);
 
     // 保存到桌面
     wchar_t desktopPath[MAX_PATH];
-    SHGetFolderPathW(NULL, CSIDL_DESKTOP, NULL, 0, desktopPath);
-    std::wstring filename = std::wstring(desktopPath) + L"\\desktop_full.bmp";
+    SHGetFolderPathW(NULL, CSIDL_DESKTOP, nullptr, 0, desktopPath);
+    std::wstring filename = std::wstring(desktopPath) + L"\\window_capture.bmp";
 
-    if (SaveBitmapToFile(desc.Width, desc.Height, filename, fullPixels)) {
-        std::wcout << L"整张桌面截图成功: " << filename << L"\n";
+    if (SaveBitmapToFile(winWidth, winHeight, filename, windowPixels)) {
+        std::wcout << L"窗口截图成功: " << filename << L"\n";
     } else {
         std::wcerr << L"保存失败！\n";
     }
 
-    // 释放资源
     cpuTex->Release();
     desktopImage->Release();
     desktopResource->Release();
@@ -140,3 +187,4 @@ int wmain() {
 
     return 0;
 }
+
